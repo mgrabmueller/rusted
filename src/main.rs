@@ -165,15 +165,73 @@ impl Buf {
     /// # Examples
     ///
     /// ```
+    /// let le = LineEnding::CrLf;
+    /// let mut buf = Buf::from_str("Überfjäll", le);
+    /// assert_eq!(buf.len(), 11);
+    ///
+    /// buf.insert_str("tjord", 5);
+    /// assert_eq!(buf.len(), 16);
+    /// assert_eq!(buf.to_string(), Ok("Übertjordfjäll".to_string()));
+    ///
+    /// buf.insert_str("bJoll", 0);
+    /// assert_eq!(buf.len(), 21);
+    /// assert_eq!(buf.to_string(), Ok("bJollÜbertjordfjäll".to_string()));
+    ///
+    /// let l = buf.len();
+    /// buf.insert_str("Twaanrö", l);
+    /// assert_eq!(buf.len(), 29);
+    /// assert_eq!(buf.to_string(), Ok("bJollÜbertjordfjällTwaanrö".to_string()));
     /// ```
     pub fn insert_str(&mut self, s: &str, pos: usize) {
+        let l = s.len();
+        self.mkgap(pos, l);
+        let mut i = pos;
+        for b in s.bytes() {
+            self.buf[i] = b;
+            i += 1;
+        }
+        self.gap += l;
+        self.gaplen -= l;
     }
 
-    pub fn mkgap(&mut self, ngap: usize, ngaplen: usize) {
+    /// Delete `cnt` bytes at position `at`.
+    ///
+    /// # Panics
+    /// Panics when `at` or `at+cnt` is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let le = LineEnding::CrLf;
+    /// let mut buf = Buf::from_str("Überfjäll", le);
+    /// assert_eq!(buf.len(), 11);
+    ///
+    /// buf.delete(7, 3);
+    /// assert_eq!(buf.len(), 8);
+    /// assert_eq!(buf.to_string(), Ok("Überfjl".to_string()));
+    /// ```
+    pub fn delete(&mut self, at: usize, cnt: usize) {
+        self.movegap(at);
+        self.gaplen += cnt;
+    }
+
+    /// Make sure that the buffer has a gap at position `ngap`, of at
+    /// least `ngaplen` bytes.
+    ///
+    /// # Panics
+    /// Panics when the new gap position is out of bounds or the
+    /// buffer size overflows.
+    fn mkgap(&mut self, ngap: usize, ngaplen: usize) {
         self.growgap(ngaplen);
         self.movegap(ngap);
     }
 
+    /// Ensure that the gap is at least `ngaplen` bytes large.  The
+    /// gap position is not changed.
+    ///
+    /// # Panics
+    /// Panics when the buffer size overflows.
+    ///
     fn growgap(&mut self, ngaplen: usize) {
         if ngaplen > self.gaplen {
             self.buf.reserve(ngaplen - self.gaplen);
@@ -184,6 +242,10 @@ impl Buf {
         }
     }
 
+    /// Move the gap to position `ngap`.
+    ///
+    /// # Panics
+    /// Panics when `ngap` is out of bounds.
     fn movegap(&mut self, ngap: usize) {
         if ngap < self.gap {
             let movecnt = self.gap - ngap;
@@ -192,25 +254,20 @@ impl Buf {
                 self.buf[self.gap + self.gaplen - 1 - i] = self.buf[self.gap - i - 1];
             }
             self.gap = ngap;
-
-            // The following helps with debugging, but could be
-            // optimized out as the bytes at buf[gap..gap+gaplen] must
-            // never be read.
-            for i in 0..self.gaplen {
-                self.buf[self.gap + i] = 0;
-            }
         } else if ngap > self.gap {
             for i in self.gap..ngap {
                 self.buf[i] = self.buf[self.gaplen + i];
             }
             self.gap = ngap;
 
-            // The following helps with debugging, but could be
-            // optimized out as the bytes at buf[gap..gap+gaplen] must
-            // never be read.
-            for i in 0..self.gaplen {
-                self.buf[self.gap + i] = 0;
-            }
+        } else {
+            return;
+        }
+        // The following helps with debugging, but could be
+        // optimized out as the bytes at buf[gap..gap+gaplen] must
+        // never be read.
+        for i in 0..self.gaplen {
+            self.buf[self.gap + i] = 0;
         }
     }
 
@@ -237,6 +294,9 @@ impl Buf {
         }
     }
 
+    /// Map an offset into the logical buffer, `p`, to an offset in
+    /// the gap buffer.  That means that the returned offset can be
+    /// used to directly access the underlying vector.
     fn index_of(&self, p: usize) -> usize {
         if p < self.gap {
             p
@@ -292,6 +352,7 @@ fn main() {
     println!("{}", buf2.to_string().unwrap());
 
     buf2.insert_str("NEW", 1);
+    println!("{:?} {}", buf2, buf2.len());
     println!("{}", buf2.to_string().unwrap());
 }
 
@@ -343,8 +404,39 @@ mod test {
         let le = LineEnding::CrLf;
         let mut buf = Buf::from_str("Überfjäll", le);
         assert_eq!(buf.len(), 11);
+
         buf.insert_str("tjord", 5);
         assert_eq!(buf.len(), 16);
-        assert_eq!(buf.to_string(), Ok("Überfjordfjäll".to_string()));
+        assert_eq!(buf.to_string(), Ok("Übertjordfjäll".to_string()));
+
+        buf.insert_str("bJoll", 0);
+        assert_eq!(buf.len(), 21);
+        assert_eq!(buf.to_string(), Ok("bJollÜbertjordfjäll".to_string()));
+
+        let l = buf.len();
+        buf.insert_str("Twaanrö", l);
+        assert_eq!(buf.len(), 29);
+        assert_eq!(buf.to_string(), Ok("bJollÜbertjordfjällTwaanrö".to_string()));
+    }
+
+    #[test]
+    fn delete() {
+        use super::{LineEnding, Buf};
+        let le = LineEnding::CrLf;
+        let mut buf = Buf::from_str("Überfjäll", le);
+        assert_eq!(buf.len(), 11);
+
+        buf.delete(7, 3);
+        assert_eq!(buf.len(), 8);
+        assert_eq!(buf.to_string(), Ok("Überfjl".to_string()));
+
+        buf.delete(0, 2);
+        assert_eq!(buf.len(), 6);
+        assert_eq!(buf.to_string(), Ok("berfjl".to_string()));
+
+        let p = buf.len() - 1;
+        buf.delete(p, 1);
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.to_string(), Ok("berfj".to_string()));
     }
 }
