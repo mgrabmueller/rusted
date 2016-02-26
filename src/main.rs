@@ -350,10 +350,7 @@ impl Buf {
                 let mut v = Vec::new();
                 v.extend(&self.buf[0..self.gap]);
                 v.extend(&self.buf[self.gap+self.gaplen..self.buf.len()]);
-                match String::from_utf8(v) {
-                    Ok(s) => Ok(s),
-                    Err(_) => Err(Error::NotUTF8)
-                }
+                String::from_utf8(v).map_err(|_| Error::NotUTF8)
             }
             _ => Err(Error::NotInTextMode)
         }
