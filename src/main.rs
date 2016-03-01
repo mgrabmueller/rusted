@@ -25,7 +25,8 @@
 //! - "Moving the gap" means moving the buffer content so that gaplen
 //!   bytes following the new gap position are unused.
 
-use std::io;
+use std::io::{self, Read};
+use std::sync::{Arc, Weak};
 use std::string::FromUtf8Error;
 use std::error;
 use std::fmt;
@@ -111,17 +112,30 @@ impl error::Error for Error {
     }
 }
 
+/// Mark a buffer positions.
+///
+/// Marks are used to remember locations inside a buffer.  They are
+/// basically only an index into the buffer, but they are moved around
+/// when text is inserted or removed in front of the mark (or when the
+/// mark is in the middel of removed content).
+#[derive(Debug)]
+pub struct Mark {
+    location: usize
+}
+
 /// Gap buffer implementation.
 #[derive(Debug)]
 pub struct Buf {
     /// Mode of the buffer.
     mode: Mode,
     /// Underlying buffer for storing the buffer contents.
-   buf: Vec<u8>,
+    buf: Vec<u8>,
     /// Position of the gap in the buffer.
     gap: usize,
     /// Length of the gap.
-    gaplen: usize
+    gaplen: usize,
+    /// Weak references to all marks.
+    marks: Vec<Weak<Mark>>
 }
 
 const DEFAULT_GAPLEN: usize = 128;
@@ -144,7 +158,8 @@ impl Buf {
             mode: mode,
             buf: Vec::new(),
             gap: 0,
-            gaplen: 0
+            gaplen: 0,
+            marks: Vec::new()
         }
     }
 
@@ -168,7 +183,8 @@ impl Buf {
             mode: Mode::Text(Encoding::UTF8, le),
             buf: buf,
             gap: 0,
-            gaplen: 0
+            gaplen: 0,
+            marks: Vec::new()
         }
     }
 
@@ -188,7 +204,8 @@ impl Buf {
             mode: mode,
             buf: Vec::with_capacity(capacity),
             gap: 0,
-            gaplen: 0
+            gaplen: 0,
+            marks: Vec::new()
         }
     }
 
@@ -243,6 +260,9 @@ impl Buf {
         self.gaplen -= l;
     }
 
+    /// Insert all the data from iterator `it' at `pos'.
+    /// # Panics
+    /// Panics when `pos' is out of bounds.
     pub fn insert_all<I>(&mut self, it: I, pos: usize)
         where I: Iterator<Item=u8> {
         let mut i = pos;
@@ -255,6 +275,31 @@ impl Buf {
             self.gap += 1;
             self.gaplen -= 1;
         }
+    }
+
+    /// Insert the contents of reader `r' at position `pos'.
+    /// # Panics
+    /// Panics when `pos' is out of bounds.
+    pub fn insert_read<R>(&mut self, r: R, pos: usize) -> Result<(), Error>
+        where R: Read {
+        let mut i = pos;
+        for bm in r.bytes() {
+            match bm {
+                Ok(b) => {
+                    if self.gaplen < DEFAULT_GAPLEN {
+                        self.mkgap(i, DEFAULT_GAPLEN);
+                    }
+                    self.buf[i] = b;
+                    i += 1;
+                    self.gap += 1;
+                    self.gaplen -= 1;
+                },
+                Err(err) => {
+                    return Err(From::from(err));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Delete `cnt` bytes at position `at`.
@@ -386,6 +431,15 @@ impl Buf {
             pos: 0
         }
     }
+
+    pub fn new_mark(&mut self, pos: usize) -> Arc<Mark> {
+        let mrk = Mark{location: pos};
+        let m = Arc::new(mrk);
+        let rm = m.clone();
+        let wm = Arc::downgrade(&m);
+        self.marks.push(wm);
+        return rm;
+    }
 }
 
 /// Iterator over the bytes of a buffer.
@@ -516,5 +570,34 @@ mod test {
         buf.delete(p, 1);
         assert_eq!(buf.len(), 5);
         assert_eq!(buf.to_string().unwrap(), "berfj".to_string());
+    }
+
+    #[test]
+    fn insert_read() {
+        use super::{Mode, Encoding, LineEnding, Buf};
+        use std::io::{BufReader};
+        use std::fs::{File};
+
+        let mode = Mode::Text(Encoding::UTF8, LineEnding::Lf);
+        let mut buf = Buf::new(mode);
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.mode, mode);
+        assert_eq!(buf.to_string().unwrap(), "".to_string());
+
+        let f = File::open("data1.txt").unwrap();
+        let reader = BufReader::new(f);
+        buf.insert_read(reader, 0).unwrap();
+
+        let f = File::open("data2.txt").unwrap();
+        let reader = BufReader::new(f);
+        buf.insert_read(reader, 2).unwrap();
+
+        let f = File::open("data1.txt").unwrap();
+        let reader = BufReader::new(f);
+        let len = buf.len();
+        buf.insert_read(reader, len).unwrap();
+
+        assert_eq!(buf.len(), 18);
+        assert_eq!(buf.to_string().unwrap(), "HaHALLO\nllo\nHallo\n".to_string());
     }
 }
