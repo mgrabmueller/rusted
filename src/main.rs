@@ -18,6 +18,23 @@
 //!            gap
 //! ```
 //!
+//! The advantage of gap buffers is that local modifications are very
+//! cheap. Consider the example above: inserting a character `x` at
+//! the current gap position is just a single write of `x` to the
+//! buffer (at the gap position), followed by incrementing `gap` and
+//! decrementing `gaplen`.  Of course, insertion must ensure that the
+//! gap is large enough to accomodate the inserted data.  After this
+//! operation, the buffer would look like this:
+//!
+//! ```text
+//!                 |-gaplen|
+//! +---+---+---+---+---+---+---+---+---+---+
+//! | H |   ä   | x |   |   | l | l | o | ! |
+//! +---+---+---+---+---+---+---+---+---+---+
+//!                 |
+//!                gap
+//! ```
+//!
 //! We use the following definitions for gap buffers:
 //!
 //! - The length of the buffer is the length of the underlying vector
@@ -26,7 +43,8 @@
 //!   bytes following the new gap position are unused.
 
 use std::io::{self, Read};
-use std::sync::{Arc, Weak};
+use std::io::prelude::Write;
+use std::sync::{Arc, Mutex};
 use std::string::FromUtf8Error;
 use std::error;
 use std::fmt;
@@ -68,7 +86,11 @@ pub enum Error {
     /// This error is returned whenever an operation is performed that
     /// is only meaningful for buffers in text mode.
     NotInTextMode,
+    /// This error is returned when a UTF-8 operation is performed on
+    /// a non-UTF-8 input or buffer.
     NotUTF8,
+    /// This error is returned when a `io::Error' is detected during a
+    /// buffer operation.
     IoError(io::Error)
 }
 
@@ -135,9 +157,11 @@ pub struct Buf {
     /// Length of the gap.
     gaplen: usize,
     /// Weak references to all marks.
-    marks: Vec<Weak<Mark>>
+    marks: Vec<Arc<Mutex<Mark>>>
 }
 
+/// This is the number of bytes that a buffer is extended whenever
+/// data is inserted into a full buffer.
 const DEFAULT_GAPLEN: usize = 128;
 
 impl Buf {
@@ -258,6 +282,7 @@ impl Buf {
         }
         self.gap += l;
         self.gaplen -= l;
+        self.adjust_marks(pos, l, true);
     }
 
     /// Insert all the data from iterator `it' at `pos'.
@@ -266,15 +291,19 @@ impl Buf {
     pub fn insert_all<I>(&mut self, it: I, pos: usize)
         where I: Iterator<Item=u8> {
         let mut i = pos;
+        let mut cnt = 0;
+        self.movegap(i);
         for b in it {
-            if self.gaplen < DEFAULT_GAPLEN {
-                self.mkgap(i, DEFAULT_GAPLEN);
+            if self.gaplen < 1 {
+                self.growgap(DEFAULT_GAPLEN);
             }
             self.buf[i] = b;
             i += 1;
+            cnt += 1;
             self.gap += 1;
             self.gaplen -= 1;
         }
+        self.adjust_marks(pos, cnt, true);
     }
 
     /// Insert the contents of reader `r' at position `pos'.
@@ -283,14 +312,17 @@ impl Buf {
     pub fn insert_read<R>(&mut self, r: R, pos: usize) -> Result<(), Error>
         where R: Read {
         let mut i = pos;
+        let mut cnt = 0;
+        self.movegap(i);
         for bm in r.bytes() {
             match bm {
                 Ok(b) => {
-                    if self.gaplen < DEFAULT_GAPLEN {
-                        self.mkgap(i, DEFAULT_GAPLEN);
+                    if self.gaplen < 1 {
+                        self.growgap(DEFAULT_GAPLEN);
                     }
                     self.buf[i] = b;
                     i += 1;
+                    cnt += 1;
                     self.gap += 1;
                     self.gaplen -= 1;
                 },
@@ -299,6 +331,7 @@ impl Buf {
                 }
             }
         }
+        self.adjust_marks(pos, cnt, true);
         Ok(())
     }
 
@@ -321,6 +354,7 @@ impl Buf {
     pub fn delete(&mut self, at: usize, cnt: usize) {
         self.movegap(at);
         self.gaplen += cnt;
+        self.adjust_marks(at, cnt, false);
     }
 
     /// Make sure that the buffer has a gap at position `ngap`, of at
@@ -432,13 +466,124 @@ impl Buf {
         }
     }
 
-    pub fn new_mark(&mut self, pos: usize) -> Arc<Mark> {
+    /// Create a new mark pointing to position `pos' in the buffer.
+    ///
+    /// The mark is automatically adjusted to point at the same byte
+    /// during following insertions and deletions, as far as possible.
+    /// When the byte the mark points to is deleted, the mark will be
+    /// adjusted to the first non-deleted byte following the tracked
+    /// byte.
+    ///
+    /// The mark may also point behind the last byte in the buffer,
+    /// either when set to the buffer length on creation, or when all
+    /// data from the pointed-to byte up to the end of the buffer is
+    /// deleted.
+    ///
+    /// # Panics
+    /// Panics when `pos' is out of range.
+    pub fn new_mark(&mut self, pos: usize) -> Arc<Mutex<Mark>> {
+        assert!(pos <= self.len());
         let mrk = Mark{location: pos};
-        let m = Arc::new(mrk);
+        let mutex = Mutex::new(mrk);
+        let m = Arc::new(mutex);
         let rm = m.clone();
-        let wm = Arc::downgrade(&m);
-        self.marks.push(wm);
+        self.marks.push(m);
         return rm;
+    }
+
+    /// For a change affecting the buffer from `pos' to `pos+cnt',
+    /// adjust all markers pointing into the buffer.  When `insert' is
+    /// true, handle an insertion of `cnt' bytes starting from `pos',
+    /// otherwise, handle a deletion of `cnt' bytes starting from
+    /// `pos'.
+    ///
+    /// # Panics
+    /// Panics when the one of the marks was locked by another thread
+    /// that has since panicked.
+    fn adjust_marks(&mut self, pos: usize, cnt: usize, insert: bool) {
+        for mr in &self.marks {
+            let mut data = mr.lock().unwrap();
+            if data.location >= pos {
+                let new_loc = if insert {
+                    data.location + cnt
+                } else if data.location >= pos + cnt {
+                    data.location - cnt
+                } else {
+                    pos
+                };
+                data.location = new_loc;
+            }
+        }
+    }
+
+    fn char_at_unsafe(&self, pos: usize) -> u8 {
+        self.buf[self.index_of(pos)]
+    }
+
+    /// Return the byte pointed to by mark `mark'.
+    ///
+    /// Returns `Some(b)' when the mark points at a buffer byte and
+    /// `None' when the mark points at the end of the buffer.
+    ///
+    /// # Panics
+    /// Panics when the mark was locked by another thread that has
+    /// since panicked.
+    pub fn at_mark(&self, mark: &Arc<Mutex<Mark>>) -> Option<u8> {
+        let data = mark.lock().unwrap();
+        if data.location < self.len() {
+            Some(self.char_at_unsafe(data.location))
+        } else {
+            None
+        }
+    }
+
+
+    /// Return the position currently pointed to by the given mark.
+    ///
+    /// # Panics
+    /// Panics when the mark was locked by another thread that has
+    /// since panicked.
+    pub fn mark_location(&self, mark: &Arc<Mutex<Mark>>) -> usize {
+        let data = mark.lock().unwrap();
+        data.location
+    }
+
+    pub fn beginning_of_line(&self, pos: usize) -> usize {
+        let mut i = pos;
+        while i > 0 {
+            i -= 1;
+            if self.char_at_unsafe(i) == b'\n' {
+                return i + 1
+            }
+        }
+        return i;
+    }
+
+    pub fn end_of_line(&self, pos: usize) -> usize {
+        let mut i = pos;
+        while i < self.len() - 1 {
+            if self.char_at_unsafe(i) == b'\n' {
+                return i
+            }
+            i += 1;
+        }
+        return i;
+    }
+
+    pub fn next_byte(&self, pos: usize) -> usize {
+        if pos < self.len() {
+            pos + 1
+        } else {
+            pos
+        }
+    }
+
+    pub fn prev_byte(&self, pos: usize) -> usize {
+        if pos > 0 {
+            pos - 1
+        } else {
+            pos
+        }
     }
 }
 
@@ -462,14 +607,62 @@ impl<'a> Iterator for Bytes<'a> {
     }
 }
 
+// This implements a minimal line-oriented editor, à la ed, the
+// STANDARD EDITOR.
 fn main() {
-    let mut buf2 = Buf::from_str("Hällo!\n", LineEnding::Lf);
-    println!("{:#?} {}", buf2, buf2.len());
-    println!("{}", buf2.to_string().unwrap());
+    let mode = Mode::Text(Encoding::UTF8, LineEnding::Lf);
+    let mut buf = Buf::new(mode);
 
-    buf2.insert_str("NEW", 1);
-    println!("{:#?} {}", buf2, buf2.len());
-    println!("{}", buf2.to_string().unwrap());
+    let prompt = b"* ";
+    let mut insert = false;
+    let mut pos = 0;
+    let mut input = String::new();
+    'repl: loop {
+        input.clear();
+        if !insert {
+            io::stdout().write(prompt).unwrap();
+            io::stdout().flush().unwrap();
+        }
+        io::stdin().read_line(&mut input).unwrap();
+
+        match input.trim() {
+            "." if insert =>
+                insert = false,
+            s if insert =>
+            {
+                let l = s.len();
+                buf.insert_str(s, pos);
+                buf.insert_str("\n", pos + l);
+                pos += l+1;
+            }
+            "quit" =>
+                break 'repl,
+            "i" =>
+                insert = true,
+            "a" => {
+                pos = buf.end_of_line(pos);
+                insert = true
+            },
+            "0" =>
+                pos = 0,
+            "$" =>
+                pos = buf.len(),
+            "p" => {
+                let sol = buf.beginning_of_line(pos);
+                let eol = buf.end_of_line(pos);
+                let t = buf.to_string().unwrap();
+                let sl = unsafe { t.slice_unchecked(sol, eol) };
+                println!("{}", sl)
+            },
+            "P" => {
+                let t = buf.to_string().unwrap();
+                println!("{}", t)
+            },
+            x =>
+                println!("? {}", x)
+        }
+    }
+
 }
 
 mod test {
@@ -483,11 +676,27 @@ mod test {
         assert_eq!(buf.to_string().unwrap(), "".to_string());
     }
 
-    #[test]
-    fn from_str() {
-        use super::{Mode, Encoding, LineEnding, Buf};
+    #[allow(dead_code)]
+    fn demo_string() -> super::Buf {
+        use super::{LineEnding, Buf};
         let le = LineEnding::CrLf;
         let buf = Buf::from_str("Überfjäll", le);
+        buf
+    }
+
+    #[allow(dead_code)]
+    fn mk_buf(s: &str) -> super::Buf {
+        use super::{LineEnding, Buf};
+        let le = LineEnding::CrLf;
+        let buf = Buf::from_str(s, le);
+        buf
+    }
+
+    #[test]
+    fn from_str() {
+        use super::{Mode, Encoding, LineEnding};
+        let le = LineEnding::CrLf;
+        let buf = demo_string();
         assert_eq!(buf.len(), 11);
         assert_eq!(buf.mode, Mode::Text(Encoding::UTF8, le));
         assert_eq!(buf.to_string().unwrap(), "Überfjäll".to_string());
@@ -504,9 +713,7 @@ mod test {
 
     #[test]
     fn bytes() {
-        use super::{LineEnding, Buf};
-        let le = LineEnding::CrLf;
-        let buf = Buf::from_str("Überfjäll", le);
+        let buf = demo_string();
         let mut v = Vec::new();
         for b in buf.bytes() {
             v.push(b);
@@ -516,9 +723,7 @@ mod test {
 
     #[test]
     fn insert_str() {
-        use super::{LineEnding, Buf};
-        let le = LineEnding::CrLf;
-        let mut buf = Buf::from_str("Überfjäll", le);
+        let mut buf = demo_string();
         assert_eq!(buf.len(), 11);
 
         buf.insert_str("tjord", 5);
@@ -553,10 +758,7 @@ mod test {
 
     #[test]
     fn delete() {
-        use super::{LineEnding, Buf};
-        let le = LineEnding::CrLf;
-        let mut buf = Buf::from_str("Überfjäll", le);
-        assert_eq!(buf.len(), 11);
+        let mut buf = demo_string();
 
         buf.delete(7, 3);
         assert_eq!(buf.len(), 8);
@@ -600,4 +802,121 @@ mod test {
         assert_eq!(buf.len(), 18);
         assert_eq!(buf.to_string().unwrap(), "HaHALLO\nllo\nHallo\n".to_string());
     }
+
+    #[test]
+    fn insert_str_mark() {
+        let mut buf = demo_string();
+
+        let mark1 = buf.new_mark(4);
+        let mark2 = buf.new_mark(5);
+        let mark3 = buf.new_mark(9);
+        assert_eq!(buf.at_mark(&mark1), Some(b'r'));
+        assert_eq!(buf.at_mark(&mark2), Some(b'f'));
+        assert_eq!(buf.at_mark(&mark3), Some(b'l'));
+
+        buf.insert_str("tjord", 5);
+        assert_eq!(buf.len(), 16);
+        assert_eq!(buf.to_string().unwrap(), "Übertjordfjäll".to_string());
+
+        assert_eq!(buf.at_mark(&mark1), Some(b'r'));
+        assert_eq!(buf.at_mark(&mark2), Some(b'f'));
+        assert_eq!(buf.at_mark(&mark3), Some(b'l'));
+    }
+
+    #[test]
+    fn delete_mark_start1() {
+        let mut buf = mk_buf("abcd");
+        let m = buf.new_mark(0);
+        assert_eq!(buf.mark_location(&m), 0);
+
+        buf.delete(0, 1);
+        assert_eq!(buf.to_string().unwrap(), "bcd".to_string());
+        assert_eq!(buf.mark_location(&m), 0);
+    }
+
+    #[test]
+    fn delete_mark_start2() {
+        let mut buf = mk_buf("abcd");
+        let m = buf.new_mark(0);
+        assert_eq!(buf.mark_location(&m), 0);
+
+        buf.delete(0, 2);
+        assert_eq!(buf.to_string().unwrap(), "cd".to_string());
+        assert_eq!(buf.mark_location(&m), 0);
+    }
+
+    #[test]
+    fn delete_mark_start3() {
+        let mut buf = mk_buf("abcd");
+        let m = buf.new_mark(1);
+        assert_eq!(buf.mark_location(&m), 1);
+        assert_eq!(buf.at_mark(&m), Some(b'b'));
+
+        buf.delete(0, 1);
+        assert_eq!(buf.to_string().unwrap(), "bcd".to_string());
+        assert_eq!(buf.mark_location(&m), 0);
+        assert_eq!(buf.at_mark(&m), Some(b'b'));
+    }
+
+    #[test]
+    fn delete_mark_start4() {
+        let mut buf = mk_buf("abcd");
+        let m = buf.new_mark(1);
+        assert_eq!(buf.mark_location(&m), 1);
+        assert_eq!(buf.at_mark(&m), Some(b'b'));
+
+        buf.delete(0, 2);
+        assert_eq!(buf.to_string().unwrap(), "cd".to_string());
+        assert_eq!(buf.mark_location(&m), 0);
+        assert_eq!(buf.at_mark(&m), Some(b'c'));
+    }
+
+    #[test]
+    fn delete_mark_all() {
+        let mut buf = mk_buf("abcd");
+        let m = buf.new_mark(0);
+        assert_eq!(buf.mark_location(&m), 0);
+
+        buf.delete(0, 4);
+        assert_eq!(buf.to_string().unwrap(), "".to_string());
+        assert_eq!(buf.mark_location(&m), 0);
+        assert_eq!(buf.at_mark(&m), None);
+    }
+
+    #[test]
+    fn delete_mark_end1() {
+        let mut buf = mk_buf("abcd");
+        let m = buf.new_mark(3);
+        assert_eq!(buf.mark_location(&m), 3);
+
+        buf.delete(3, 1);
+        assert_eq!(buf.to_string().unwrap(), "abc".to_string());
+        assert_eq!(buf.mark_location(&m), 3);
+        assert_eq!(buf.at_mark(&m), None);
+    }
+
+    #[test]
+    fn delete_mark_end2() {
+        let mut buf = mk_buf("abcd");
+        let m = buf.new_mark(3);
+        assert_eq!(buf.mark_location(&m), 3);
+
+        buf.delete(2, 2);
+        assert_eq!(buf.to_string().unwrap(), "ab".to_string());
+        assert_eq!(buf.mark_location(&m), 2);
+        assert_eq!(buf.at_mark(&m), None);
+    }
+
+    #[test]
+    fn delete_mark_middle() {
+        let mut buf = mk_buf("abcd");
+        let m = buf.new_mark(2);
+        assert_eq!(buf.mark_location(&m), 2);
+
+        buf.delete(1, 2);
+        assert_eq!(buf.to_string().unwrap(), "ad".to_string());
+        assert_eq!(buf.mark_location(&m), 1);
+        assert_eq!(buf.at_mark(&m), Some(b'd'));
+    }
+
 }
